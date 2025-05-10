@@ -18,12 +18,12 @@ function Block:new()
 end
 
 -- @class Result
--- @field body string:
+-- @field body string[]:
 -- @field rowstart integer:
 Result = {}
-function Result:new(block, string)
+function Result:new(block, result)
 	newobj = {
-		body = string,
+		result = result,
 		rowstart = block.rowend,
 	}
 	self.__index = self
@@ -46,6 +46,10 @@ M._parse = function(lines)
 		elseif vim.startswith(line, "```") then
 			block.rowend = row
 			assert((block.rowstart ~= -1) and (block.rowend ~= -1))
+			-- TODO: clean up body
+			-- drop comment
+			-- replace \n with <space>
+			-- maybe use string.sub
 			table.insert(blocks, block)
 			block = Block:new()
 			is_block = false
@@ -69,42 +73,11 @@ M._select_block = function(blocks)
 	return block
 end
 
--- @param block Block
--- @return output string
-M._evaluate_block = function(block)
-	local stdout = ""
-	local stderr = ""
-	local cmd = "bash -c '" .. block.body .. "'"
-
-	local id = vim.fn.jobstart(cmd, {
-		on_stdout = function(_, data)
-			if data and #data > 1 then
-				stdout = stdout .. table.concat(data, "\n")
-			end
-		end,
-		on_stderr = function(_, data)
-			if data and #data > 1 then
-				stderr = stderr .. table.concat(data, "\n")
-			end
-		end,
-		stdout_buffered = true,
-		stderr_buffered = true,
-	})
-	_ = vim.fn.jobwait({ id })
-	if stdout then
-		return stdout
-	elseif stderr then
-		return stderr
-	else
-		assert(false, "should be unreachable, cmd=" .. table.concat(block.body, "\n"))
-	end
-end
-
 -- @param content string
 -- @return lines string[]
-M._split = function(content)
+M._split = function(content, delimiter)
 	local lines = {}
-	for s in content:gmatch("[^\r\n]+") do
+	for s in content:gmatch(delimiter) do
 		table.insert(lines, s)
 	end
 	return lines
@@ -112,12 +85,119 @@ end
 
 -- @param result Result
 -- @return lines string[]
-M._write = function(result)
-	local response = "```output\n" .. result.body .. "```\n"
-	local lines = M._split(response)
-	for idx, line in ipairs(lines) do
-		idx = idx - 1
-		vim.api.nvim_buf_set_lines(0, result.rowstart + idx, result.rowstart + idx, false, { line })
+M._write = function(rowstart, body)
+	if body ~= nil then
+		local response = "```output\n" .. table.concat(body, "\n") .. "\n```\n"
+		local lines = M._split(response, "[^\r\n]+")
+		for idx, line in ipairs(lines) do
+			idx = idx - 1
+			vim.api.nvim_buf_set_lines(0, rowstart + idx, rowstart + idx, false, { line })
+		end
+	end
+end
+
+local loop = vim.loop
+local api = vim.api
+local results_from_call = {}
+local store_results = {}
+
+-- @param err string
+-- @param data table
+local function read(err, data)
+	if err then
+		-- TODO handle err
+		print("ERROR: ", err)
+	end
+	if data then
+		local vals = vim.split(data, "\n")
+		for _, d in pairs(vals) do
+			if d == "" then
+				goto continue
+			end
+			table.insert(results_from_call, d)
+			::continue::
+		end
+	end
+end
+
+-- @param block string
+-- @return (cmd, env) (table, table)
+function M._split_cmd(cmd_string)
+	local lines = string.gmatch(cmd_string, "[\"']?%S+[\"']?")
+	local env = {}
+	local cmd = {}
+	-- FIXME: environment variable
+	for v in lines do
+		if string.find(v, "=") then
+			local e = M._split(v, "[a-zA-Z1-9_]+")
+			env[e[1]] = e[2]
+		elseif v:sub(1, 1) == "$" then
+			v = string.sub(v, 2)
+			table.insert(cmd, vim.fn.getenv(v))
+			-- print("after: " .. vim.fn.getenv("AWS_PROFILE"))
+			-- print("after: " .. uv.os_getenv("AWS_PROFILE"))
+		else
+			table.insert(cmd, v)
+		end
+	end
+	return cmd, env
+end
+
+-- @param block Block
+-- @return nil
+--     sideeffect on store_results
+function M._evaluate_block(block)
+	local body = block.body
+	local original = {}
+
+	local uv = vim.uv
+	local stdout = uv.new_pipe(false)
+	local stderr = uv.new_pipe(false)
+	local function show()
+		local count = #store_results
+		for i = 0, count do
+			store_results[i] = nil
+		end -- clear the table for the next search
+
+		count = #results_from_call
+		if count > 0 then
+			for _, v in pairs(results_from_call) do
+				table.insert(store_results, v)
+			end
+
+			for i = 0, count do
+				results_from_call[i] = nil
+			end -- clear the table for the next search
+		end
+	end
+
+	cmd, env = M._split_cmd(body)
+	for k, v in pairs(env) do
+		original[k] = vim.fn.getenv(k)
+		uv.os_setenv(k, v)
+	end
+	-- print(cmd[1])
+	-- print(unpack(cmd, 2))
+
+	handle = uv.spawn(
+		cmd[1],
+		{
+			args = { unpack(cmd, 2) },
+			stdio = { nil, stdout, stderr },
+		},
+		vim.schedule_wrap(function()
+			stdout:read_stop()
+			stderr:read_stop()
+			stdout:close()
+			stderr:close()
+			handle:close()
+			show()
+		end)
+	)
+	uv.read_start(stdout, read)
+	uv.read_start(stderr, read)
+	for k, v in pairs(original) do
+		uv.os_setenv(k, tostring(v))
 	end
 end
 
@@ -128,8 +208,8 @@ M.run = function(opts)
 
 	local block = M._select_block(blocks)
 	if block and block.body ~= nil and #block.body > 0 then
-		local res = Result:new(block, M._evaluate_block(block))
-		M._write(res)
+		M._evaluate_block(block)
+		M._write(block.rowend, store_results)
 	end
 end
 
